@@ -1,0 +1,1141 @@
+# Load Balancing --- Complete System Design Interview Notes
+
+## For Senior Software Engineer and Engineering Leader Interviews
+
+> **Purpose:** Practical, interview-ready notes covering load-balancer
+> fundamentals, algorithms, failure handling, Layer 4 vs Layer 7, high
+> availability, observability, latency percentiles, capacity testing,
+> production troubleshooting, and a hands-on Nginx lab.
+
+------------------------------------------------------------------------
+
+## 1. Executive summary: What is load balancing?
+
+A **load balancer** distributes incoming requests or connections across
+multiple backend servers. It helps improve availability, scalability,
+resilience, and resource utilisation.
+
+Without a load balancer:
+
+``` text
+Clients ──────> One application server
+```
+
+Potential problems: - The server becomes a bottleneck as traffic
+grows. - A server failure can make the application unavailable. -
+Deployments and maintenance become harder. - There is no central point
+for distributing work across multiple instances.
+
+With a load balancer:
+
+``` text
+                    ┌──> Backend A
+Clients ──> Load ───┼──> Backend B
+             Balancer└──> Backend C
+```
+
+The load balancer selects a backend using a policy, checks or observes
+backend health, and forwards the request or connection.
+
+### Benefits
+
+-   **Scalability:** Add backend instances to handle more traffic,
+    subject to shared bottlenecks.
+-   **Availability:** Avoid routing new requests to known-unhealthy
+    backends.
+-   **Resilience:** Continue serving traffic when a backend fails, if
+    enough healthy capacity remains.
+-   **Traffic management:** Route by path, hostname, headers, connection
+    count, or other criteria depending on the load balancer.
+-   **Operational control:** Support gradual rollouts, draining, and
+    controlled traffic shifts when configured.
+
+### What a load balancer does not guarantee
+
+-   It does not automatically fix slow application code or a slow
+    database.
+-   It does not make a stateful application stateless.
+-   It does not guarantee high availability if the load balancer or its
+    entry point is a single point of failure.
+-   It does not create unlimited capacity.
+-   It does not guarantee even CPU usage merely because request counts
+    are evenly distributed.
+
+------------------------------------------------------------------------
+
+## 2. A request's journey
+
+A typical HTTP request may follow this path:
+
+1.  A client resolves the service hostname.
+2.  The client connects to the public or internal entry point.
+3.  The load balancer accepts the connection.
+4.  It may terminate TLS and inspect HTTP information.
+5.  It chooses a healthy backend according to its algorithm and routing
+    rules.
+6.  It forwards the request.
+7.  The backend may call a database or other services.
+8.  The response returns through the load balancer to the client.
+9.  Metrics, logs, and traces help operators understand the request.
+
+Example:
+
+``` text
+Browser
+  |
+  v
+DNS / highly available entry point
+  |
+  v
+Load balancer (TLS, routing, health/failure handling)
+  |
+  +----> API instance A ----+
+  +----> API instance B ----+----> Database
+  +----> API instance C ----+
+```
+
+**Interview point:** A load balancer is one part of a distributed
+system. Consider the whole path, including DNS, networking, application
+instances, connection pools, databases, and downstream dependencies.
+
+------------------------------------------------------------------------
+
+## 3. Load-balancing algorithms
+
+No algorithm is best for every workload. Select one based on backend
+capacity, request cost, connection duration, state, and locality
+requirements.
+
+### 3.1 Round robin
+
+**How it works:** Send requests to backends in sequence.
+
+Example: A → B → C → A → B → C.
+
+If nine comparable requests are distributed across three equally capable
+servers, each may receive three requests.
+
+**Advantages** - Simple and easy to reason about. - Works well when
+servers have similar capacity and requests have similar cost.
+
+**Limitations** - Equal request counts do not mean equal work. - One
+request might take 5 ms and another 5 seconds. - Does not inherently
+account for current load or backend capacity.
+
+**Use when:** Backends are similar and request costs are reasonably
+uniform.
+
+### 3.2 Weighted round robin
+
+Assign different weights to backends to reflect relative capacity.
+
+Example: - A weight 1 - B weight 2 - C weight 3
+
+Approximate traffic shares are 1/6, 2/6, and 3/6 respectively over a
+sufficiently large number of selections, subject to implementation
+details and health state.
+
+**Advantages:** Accounts for different server capacities.
+
+**Limitations:** Weights are configured assumptions. Capacity can change
+as workloads and resources change.
+
+**Use when:** Instances have known, stable differences in capacity.
+
+### 3.3 Least connections
+
+Select the backend with the fewest active connections.
+
+**Why it can help:** A backend with long-running requests may have more
+active connections than another backend even if both have received the
+same number of requests.
+
+**Limitations** - Active connections are not the same as CPU utilisation
+or actual work. - Connection reuse, HTTP/2 multiplexing, and different
+request costs complicate interpretation. - A low connection count does
+not guarantee a backend is healthy or fast.
+
+**Use when:** Connection duration varies significantly and active
+connections are a useful proxy for load.
+
+### 3.4 IP hash / client affinity
+
+Choose a backend based on the client's IP address or another stable key,
+depending on the implementation.
+
+**Purpose:** Increase the chance that a client returns to the same
+backend.
+
+**Limitations** - Many clients may share an IP because of NAT or
+corporate proxies. - Client IPs can change. - Backend membership changes
+can remap clients. - Affinity can create uneven distribution. - It is
+not a replacement for storing shared session state safely.
+
+**Use when:** Affinity is needed for a specific reason and its
+trade-offs are understood.
+
+### 3.5 Consistent hashing
+
+Map a key---such as a tenant ID, cache key, or user ID---to a backend
+using a consistent-hashing scheme.
+
+**Purpose:** Preserve key-to-backend locality while reducing remapping
+when backend membership changes.
+
+**Advantages** - Useful for distributed caches and sharded systems. -
+Can reduce unnecessary cache misses when nodes are added or removed.
+
+**Limitations** - Hot keys can overload a single backend. - Key choice
+matters. - It does not automatically provide data replication,
+correctness, or fault tolerance. - The exact behaviour depends on the
+hashing implementation and configuration.
+
+**Use when:** Stable key placement or cache locality matters.
+
+### 3.6 Least response time
+
+Some load-balancing products offer algorithms that consider response
+time and load. Availability and exact behaviour depend on the product
+and edition.
+
+**Use when:** The product supports it and observed response time is a
+meaningful signal. Validate the algorithm under realistic load; do not
+assume every Nginx edition supports the same features.
+
+### Algorithm selection checklist
+
+Ask: 1. Are backend capacities equal? 2. Do request costs vary
+significantly? 3. Are requests short-lived or long-lived? 4. Is
+client/session affinity genuinely required? 5. Is cache or shard
+locality important? 6. What happens when a backend joins or leaves? 7.
+Can the algorithm cause hot spots? 8. What metrics will show whether it
+is working?
+
+------------------------------------------------------------------------
+
+## 4. Layer 4 versus Layer 7 load balancing
+
+### Layer 4 (L4)
+
+Works primarily with transport-level information such as IP addresses,
+ports, and TCP/UDP connections.
+
+**Strengths** - Can be efficient for connection-level distribution. -
+Does not need to interpret full HTTP semantics.
+
+**Limitations** - Generally cannot make decisions based on HTTP paths or
+headers in the way an L7 HTTP proxy can.
+
+### Layer 7 (L7)
+
+Understands application protocols such as HTTP and can route using
+information such as: - URL path - Hostname - HTTP headers - Cookies or
+other supported request attributes
+
+Example: - `/api/accounts/` → Accounts service - `/api/orders/` → Orders
+service
+
+### When to choose which
+
+Choose L4 when connection-level routing is sufficient or the application
+protocol does not need HTTP-aware routing. Choose L7 when you need HTTP
+routing, TLS termination, HTTP-level policies, or application-aware
+observability.
+
+The choice depends on the specific load balancer; many architectures
+combine L4 and L7 components.
+
+------------------------------------------------------------------------
+
+## 5. TLS termination and security
+
+**TLS termination** means the load balancer accepts an encrypted TLS
+connection and decrypts it so it can process the request.
+
+Possible flows:
+
+``` text
+Option A:
+Client --HTTPS--> Load balancer --HTTP--> Backend
+
+Option B:
+Client --HTTPS--> Load balancer --HTTPS--> Backend
+```
+
+Option B protects traffic on the backend hop as well. The appropriate
+choice depends on threat model, network boundaries, compliance, and
+operational design.
+
+Questions to ask: - Where is TLS terminated? - Is traffic encrypted
+between the load balancer and backends? - How are certificates issued,
+renewed, and rotated? - Are sensitive headers or tokens logged
+accidentally? - Are client IP and forwarded headers trusted only from
+known proxies? - Does the application correctly understand the original
+scheme and client address?
+
+**Important:** Forwarded headers such as `X-Forwarded-For` must be
+handled with a trusted-proxy policy. Do not blindly trust values
+supplied by arbitrary clients.
+
+------------------------------------------------------------------------
+
+## 6. Health checks and failure handling
+
+A load balancer needs a way to avoid routing new traffic to backends
+that cannot serve it.
+
+### Liveness versus readiness
+
+-   **Liveness:** Is the process alive, or should it be restarted?
+-   **Readiness:** Is the instance ready to receive traffic now?
+
+Readiness is often the more relevant signal for routing. A process may
+be alive but not ready to serve requests.
+
+Health-check design should avoid making every transient downstream
+dependency failure cause all instances to become unready at once.
+Consider which dependencies are essential and whether the service can
+degrade gracefully.
+
+### Active versus passive health checks
+
+-   **Active health checks:** The load balancer periodically probes
+    backends. Feature support depends on the product and edition.
+-   **Passive failure detection:** The load balancer infers problems
+    from real requests, failures, and timeouts.
+
+For Nginx Open Source, passive upstream failure handling uses parameters
+such as `max_fails` and `fail_timeout`. Active health-check directives
+are available in NGINX Plus; do not assume they are available in Open
+Source.
+
+Example:
+
+``` nginx
+upstream backend_servers {
+    server 127.0.0.1:5001 max_fails=2 fail_timeout=10s;
+    server 127.0.0.1:5002 max_fails=2 fail_timeout=10s;
+    server 127.0.0.1:5003 max_fails=2 fail_timeout=10s;
+}
+```
+
+Interpretation: under the applicable conditions, repeated unsuccessful
+attempts can cause a server to be considered unavailable for a period.
+Exact semantics depend on the Nginx configuration and upstream type.
+
+### What happens when a backend fails?
+
+1.  Requests to that backend may fail or time out.
+2.  The load balancer observes failures.
+3.  It may temporarily avoid the backend according to its failure
+    policy.
+4.  Traffic shifts to surviving backends.
+5.  The remaining backends receive more load.
+6.  If they lack spare capacity, latency and errors may rise.
+7.  Retries can amplify the load further.
+
+**Key lesson:** Failover is not the same as maintaining performance. The
+remaining system must have enough capacity to absorb the lost traffic.
+
+------------------------------------------------------------------------
+
+## 7. Timeouts, retries, and cascading failures
+
+### Timeouts
+
+Timeouts bound how long a component waits. They should be consistent
+with the overall request deadline and the time budget of downstream
+operations.
+
+In Nginx, common directives include: - `proxy_connect_timeout`: time
+allowed to establish the upstream connection. - `proxy_send_timeout`:
+timeout between successive writes while sending the request to the
+upstream. - `proxy_read_timeout`: timeout between successive reads while
+reading the upstream response; it is not necessarily a total request
+deadline.
+
+Example:
+
+``` nginx
+location / {
+    proxy_pass http://backend_servers;
+
+    proxy_connect_timeout 1s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 5s;
+}
+```
+
+Choose values from measured service behaviour and product requirements
+rather than copying arbitrary values into production.
+
+### Retries
+
+Retries can improve resilience to transient failures, but they also
+create additional work.
+
+Potential danger: - A client sends a request. - The backend performs the
+operation but the response is lost. - The client retries. - The
+operation executes twice.
+
+This is particularly important for payments, order creation, and other
+non-idempotent operations.
+
+**Safe retry principles** - Retry only appropriate failures. - Bound
+retry count and total retry time. - Use exponential backoff with jitter
+where appropriate. - Respect an overall deadline. - Avoid retrying
+non-idempotent operations unless correctness is protected, for example
+with idempotency keys. - Avoid retries at multiple layers multiplying
+each other. - Monitor retry volume and retry success rate.
+
+Example Nginx settings, subject to endpoint semantics and testing:
+
+``` nginx
+location / {
+    proxy_pass http://backend_servers;
+
+    proxy_connect_timeout 1s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 5s;
+
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+    proxy_next_upstream_tries 2;
+    proxy_next_upstream_timeout 3s;
+}
+```
+
+Review retry behaviour carefully before applying it to writes or
+streaming responses.
+
+### Cascading failure
+
+A cascading failure occurs when one failure causes load or errors to
+increase elsewhere, leading to further failures.
+
+Example: 1. One backend fails. 2. Its traffic shifts to the survivors.
+3. Survivors become overloaded. 4. Response times increase. 5. Clients
+and proxies retry. 6. Retries add more load. 7. More backends fail.
+
+Ways to reduce the risk: - Maintain capacity headroom. - Use bounded
+retries and deadlines. - Apply load shedding or admission control. - Use
+circuit breakers where appropriate. - Isolate resource pools with
+bulkheads. - Scale or reduce incoming load based on evidence. - Make
+dependencies degrade gracefully where possible.
+
+------------------------------------------------------------------------
+
+## 8. High availability and the single point of failure
+
+Two Nginx instances do not automatically make a system highly available.
+
+If all clients depend on one non-redundant IP, gateway, DNS path, or
+network component, that component can still be a single point of
+failure.
+
+High availability must consider: - Load balancer instances - Public or
+internal entry point - Network and routing - DNS and failover
+behaviour - Configuration distribution - Certificates and secrets -
+Backend instances - Data stores and downstream dependencies - Monitoring
+and operational response
+
+Common approaches include: - Managed load-balancing services with
+built-in redundancy - Active-passive instances with a reliable failover
+mechanism - Active-active designs with resilient routing and health
+handling
+
+Each has trade-offs in cost, complexity, failover time, and operational
+burden.
+
+**Engineering leader perspective:** Ask what failure scenarios the
+design actually survives, how quickly it recovers, and how that claim
+has been tested. Avoid claiming high availability based only on the
+number of instances.
+
+------------------------------------------------------------------------
+
+## 9. Capacity planning and failure capacity
+
+A first approximation:
+
+``` text
+Nominal capacity = number of healthy servers × tested capacity per server
+```
+
+Example: - 3 servers - Each can sustain 400 requests/second under the
+tested workload - Nominal aggregate capacity = 1,200 requests/second
+
+If one server fails:
+
+``` text
+Remaining nominal capacity = 2 × 400 = 800 requests/second
+```
+
+If incoming load is 1,000 requests/second, the remaining two servers
+cannot sustain that rate under these assumptions.
+
+This calculation is only a starting point. Real capacity is constrained
+by: - Workload and request mix - Database throughput - Connection
+pools - Network limits - CPU and memory - Garbage collection or runtime
+pauses - Downstream APIs - Queue sizes - Latency and error-rate
+objectives - Uneven distribution and hot keys
+
+### Safe capacity
+
+Do not plan to operate continuously at the absolute maximum measured
+throughput. Define a safe operating point that meets latency and
+reliability objectives and leaves headroom for bursts and failures.
+
+Capacity tests should answer: 1. What load can the system sustain while
+meeting its SLOs? 2. What is the saturation point? 3. What capacity
+remains after a backend or zone failure? 4. Which shared component
+becomes the bottleneck first? 5. How does latency behave as offered load
+increases?
+
+------------------------------------------------------------------------
+
+## 10. Observability: metrics, logs, and traces
+
+### Metrics --- identify trends and symptoms
+
+Useful load-balancer and application metrics include: - Request rate /
+throughput - Error rate, especially 5xx responses - Latency
+distribution: P50, P95, P99 - Active connections - Backend health and
+available backend count - Requests per backend - Upstream connection
+failures and timeouts - Retry rate - CPU, memory, network, and
+connection-pool utilisation - Queue depth and saturation signals where
+available
+
+### Logs --- investigate individual requests
+
+Useful access-log fields include: - Timestamp - Request path or route
+(avoid logging secrets or sensitive query values) - HTTP status -
+Backend address - Upstream status - Request duration - Upstream response
+duration - Request or correlation ID, where supported and safely
+propagated
+
+### Traces --- understand cross-service latency
+
+Distributed traces show spans across services and help answer: - Did the
+load balancer spend time waiting on the upstream? - Did the API spend
+time in the database? - Which downstream call dominated latency? - Was
+time spent in queueing, retries, or application work?
+
+### A useful diagnostic principle
+
+A metric tells you *what pattern exists*. Logs help establish *what
+happened to a particular request*. Traces help show *where time was
+spent across service boundaries*.
+
+No single signal should be treated as definitive without context.
+
+------------------------------------------------------------------------
+
+## 11. Latency percentiles and tail latency
+
+Percentiles describe the distribution of request times.
+
+-   **P50:** 50% of requests finish at or below this latency.
+-   **P95:** 95% finish at or below this latency.
+-   **P99:** 99% finish at or below this latency.
+
+Illustrative example for 100 requests: - P50 = 100 ms - P95 = 300 ms -
+P99 = 1 second - The slowest request = 4 seconds
+
+The exact percentile values depend on the dataset and percentile
+calculation method.
+
+### Why average latency is not enough
+
+A good average can hide slow requests. Tail latency matters for customer
+experience, chained microservice calls, and operations that require
+multiple downstream responses.
+
+Potential causes: - Slow database queries - Lock contention - Garbage
+collection pauses - Connection-pool exhaustion - Long queues - Uneven
+backend load - Network problems - Slow third-party services - Retries -
+Resource saturation
+
+### Interview answer
+
+> "I would monitor latency percentiles, especially P95 and P99,
+> alongside throughput and error rates. If P99 increases while P50
+> remains stable, I would investigate outliers such as queueing, slow
+> dependencies, uneven backend load, connection-pool exhaustion, or
+> retries rather than assuming all requests are slow."
+
+------------------------------------------------------------------------
+
+## 12. Nginx observability lab
+
+This practical lab uses Nginx as a local HTTP load balancer and three
+simple backends.
+
+### Architecture
+
+``` text
+Client
+  |
+  v
+Nginx :8080
+  |
+  +----> Backend A :5001
+  +----> Backend B :5002
+  +----> Backend C :5003
+```
+
+Example backend addresses are local to the machine. Use your own project
+directory and existing process setup.
+
+### Nginx upstream configuration
+
+``` nginx
+upstream backend_servers {
+    server 127.0.0.1:5001;
+    server 127.0.0.1:5002;
+    server 127.0.0.1:5003;
+}
+```
+
+Round robin is the default selection method for this basic upstream
+configuration.
+
+### Weighted round robin
+
+``` nginx
+upstream backend_servers {
+    server 127.0.0.1:5001 weight=1;
+    server 127.0.0.1:5002 weight=2;
+    server 127.0.0.1:5003 weight=3;
+}
+```
+
+### Least connections
+
+``` nginx
+upstream backend_servers {
+    least_conn;
+    server 127.0.0.1:5001;
+    server 127.0.0.1:5002;
+    server 127.0.0.1:5003;
+}
+```
+
+### Basic HTTP proxy configuration
+
+``` nginx
+worker_processes 1;
+pid /tmp/loadbalancinglab-nginx.pid;
+error_log /tmp/loadbalancinglab-error.log;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format performance
+        '$time_iso8601 '
+        'status=$status '
+        'request="$request" '
+        'request_time=$request_time '
+        'upstream=$upstream_addr '
+        'upstream_status=$upstream_status '
+        'upstream_time=$upstream_response_time '
+        'bytes=$body_bytes_sent';
+
+    access_log /tmp/loadbalancinglab-access.log performance;
+
+    upstream backend_servers {
+        server 127.0.0.1:5001 max_fails=2 fail_timeout=10s;
+        server 127.0.0.1:5002 max_fails=2 fail_timeout=10s;
+        server 127.0.0.1:5003 max_fails=2 fail_timeout=10s;
+    }
+
+    server {
+        listen 8080;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://backend_servers;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_connect_timeout 2s;
+            proxy_read_timeout 10s;
+        }
+    }
+}
+```
+
+This is a learning configuration, not a complete production
+configuration. Review trusted headers, TLS, security, logging privacy,
+resource limits, and operational requirements before production use.
+
+### Validate and run
+
+From the directory containing `nginx.conf`:
+
+``` bash
+nginx -t -c "$PWD/nginx.conf"
+nginx -c "$PWD/nginx.conf"
+```
+
+Send one request:
+
+``` bash
+curl -i http://127.0.0.1:8080/
+```
+
+Send multiple requests and measure client-observed total time:
+
+``` bash
+for i in {1..10}; do
+  curl -s -o /dev/null \
+    -w 'status=%{http_code} total=%{time_total}s\n' \
+    http://127.0.0.1:8080/
+done
+```
+
+Inspect logs:
+
+``` bash
+tail -n 20 /tmp/loadbalancinglab-access.log
+tail -n 50 /tmp/loadbalancinglab-error.log
+```
+
+If the running Nginx instance uses a different config or PID file, use
+the matching settings. Do not assume a reload succeeded unless the
+command and logs confirm it.
+
+### Interpret important timing fields
+
+-   `request_time`: time Nginx spends processing the request until the
+    access log is written.
+-   `upstream_response_time`: time associated with the upstream
+    response; retries can result in multiple values.
+-   `upstream_addr`: backend address or addresses involved.
+-   `upstream_status`: upstream status value or values.
+
+If request time and upstream time are both high, investigate the backend
+and its dependencies. If they differ substantially, investigate other
+parts of the request path as well. These fields narrow the
+investigation; they do not by themselves prove root cause.
+
+------------------------------------------------------------------------
+
+## 13. Capacity testing with `hey`
+
+A lightweight tool such as `hey` can generate concurrent HTTP requests
+for a local learning lab.
+
+Install with Homebrew if available:
+
+``` bash
+brew install hey
+```
+
+Run a modest test:
+
+``` bash
+hey -n 500 -c 10 http://127.0.0.1:8080/
+```
+
+-   `-n 500`: 500 total requests.
+-   `-c 10`: 10 concurrent workers.
+
+Record: - Requests per second - Response-time distribution - Status
+codes and failures - Backend distribution - CPU and memory during the
+test
+
+### Recommended test progression
+
+1.  **Baseline:** Confirm correctness at low traffic.
+2.  **Ramp-up:** Increase load gradually.
+3.  **Observe:** Record throughput, P95/P99, errors, CPU, memory, and
+    connections.
+4.  **Find saturation:** Identify where latency rises sharply, errors
+    appear, or throughput stops increasing.
+5.  **Failure test:** Stop one backend in a controlled local test and
+    observe the result.
+6.  **Recovery test:** Restart the backend and verify recovery.
+7.  **Repeat:** Change one variable at a time and compare results.
+
+A short local test does not establish production capacity. Use
+representative request mixes, sufficient duration, repeatable test
+conditions, and safe authorization. Avoid testing systems you do not own
+or have permission to test.
+
+------------------------------------------------------------------------
+
+## 14. Production troubleshooting playbook
+
+Scenario: request rate doubles, P95 rises from 200 ms to 1.5 seconds,
+502/504 errors increase, and one backend appears to receive much more
+traffic.
+
+### Step 1 --- Confirm the impact
+
+Check: - Is the issue global or limited to one route? - When did it
+begin? - Did traffic, deployment, configuration, or dependency health
+change? - What happened to throughput, P50/P95/P99, and 5xx rate?
+
+### Step 2 --- Inspect load-balancer logs
+
+``` bash
+tail -n 100 /tmp/loadbalancinglab-access.log
+tail -n 100 /tmp/loadbalancinglab-error.log
+```
+
+Look for: - Repeated upstream errors - Timeouts - Uneven backend
+selection - Unexpected status codes - Patterns tied to one route or time
+window
+
+### Step 3 --- Check backends directly
+
+``` bash
+curl -i --max-time 3 http://127.0.0.1:5001/
+curl -i --max-time 3 http://127.0.0.1:5002/
+curl -i --max-time 3 http://127.0.0.1:5003/
+```
+
+Adapt paths to the actual application. Compare latency and status codes.
+A direct request is useful, but it does not reproduce all conditions
+experienced through the load balancer.
+
+### Step 4 --- Identify the bottleneck
+
+Investigate: - CPU and memory - Active connections - Thread or worker
+saturation - Database latency and connection pools - Downstream service
+latency - Queue depth - Network errors - Retry rates - Backend
+distribution
+
+### Step 5 --- Mitigate according to evidence
+
+Potential actions: - Reduce or shed excess traffic. - Remove a confirmed
+unhealthy backend from service. - Add capacity if the bottleneck is
+scalable. - Fix a slow query or downstream dependency. - Reduce unsafe
+retries. - Adjust timeouts only when the evidence and end-to-end
+deadline justify it.
+
+Do not reflexively restart everything or increase timeouts without
+understanding the failure mode.
+
+### Step 6 --- Verify and learn
+
+Confirm: - Error rate has fallen. - Latency percentiles have
+recovered. - Throughput is stable. - Surviving instances are not
+overloaded. - The mitigation did not cause another failure.
+
+After recovery, document root cause, customer impact, detection gap,
+remediation, and preventive actions.
+
+### Common HTTP signals
+
+  -----------------------------------------------------------------------
+  Signal                              Possible causes to investigate
+  ----------------------------------- -----------------------------------
+  502 Bad Gateway                     Backend connection failure, invalid
+                                      upstream response, proxy/upstream
+                                      problem
+
+  504 Gateway Timeout                 Upstream did not respond within the
+                                      relevant timeout
+
+  503 Service Unavailable             Service unavailable, overload, or
+                                      no usable backend, depending on
+                                      configuration
+
+  High P99, normal P50                Tail latency, outliers, queues,
+                                      slow dependencies, uneven work
+
+  All backends slow                   Shared bottleneck, database,
+                                      network, or load balancer
+
+  One backend slow                    Instance-specific resource or
+                                      application problem
+  -----------------------------------------------------------------------
+
+These are diagnostic clues, not proof. Correlate with logs, metrics,
+traces, and recent changes.
+
+------------------------------------------------------------------------
+
+## 15. Little's Law and queueing intuition
+
+Little's Law:
+
+``` text
+L = λ × W
+```
+
+Where: - `L` = average number of requests in the system - `λ` =
+throughput in requests per second - `W` = average time in the system in
+seconds
+
+Example:
+
+``` text
+Throughput = 200 requests/second
+Average time = 0.1 seconds
+L = 200 × 0.1 = 20 requests
+```
+
+If throughput remains 200 requests/second but average time rises to 1
+second:
+
+``` text
+L = 200 × 1 = 200 requests
+```
+
+There are now about 200 requests in the system on average, under the
+assumptions of a stable system and consistent measurement boundaries.
+
+**Intuition:** Rising latency can mean requests are spending longer in
+the system, often waiting for constrained resources. Little's Law
+describes the relationship; it does not alone identify the cause.
+
+------------------------------------------------------------------------
+
+## 16. System design interview questions and answer frameworks
+
+### Q1. What is a load balancer, and why use one?
+
+**Answer framework:** 1. Define request or connection distribution. 2.
+Explain scaling, availability, and traffic management. 3. Mention
+algorithms and health handling. 4. State that it cannot eliminate shared
+bottlenecks or guarantee HA by itself.
+
+### Q2. How would you choose a load-balancing algorithm?
+
+**Answer framework:** 1. Understand backend capacity and workload
+variation. 2. Start with round robin for similar backends and comparable
+request cost. 3. Consider weighted round robin for different capacities.
+4. Consider least connections for varying connection duration. 5.
+Consider consistent hashing for key locality. 6. Validate with realistic
+traffic and latency/error metrics.
+
+### Q3. How do you handle a backend failure?
+
+**Answer framework:** 1. Detect failure through health signals or
+request outcomes. 2. Stop sending new work to the unhealthy backend
+where supported. 3. Bound timeouts and retries. 4. Ensure retry
+semantics are safe. 5. Check surviving capacity. 6. Monitor recovery and
+avoid cascading failure.
+
+### Q4. What is the difference between L4 and L7?
+
+**Answer framework:** L4 routes using transport-level information such
+as IPs and ports. L7 understands application information such as HTTP
+paths and headers. Select based on routing needs, protocol, performance,
+security, and observability.
+
+### Q5. How would you make a load balancer highly available?
+
+**Answer framework:** 1. Identify every possible single point of
+failure. 2. Provide redundant load-balancer instances or a managed HA
+service. 3. Make the entry point and network path resilient. 4. Consider
+zones, DNS/routing, health handling, and configuration distribution. 5.
+Test actual failover and measure recovery time.
+
+### Q6. How would you investigate high P99 latency?
+
+**Answer framework:** 1. Confirm the time window and affected routes. 2.
+Compare P50/P95/P99 with request rate and error rate. 3. Compare request
+time with upstream time. 4. Inspect backend distribution and resource
+saturation. 5. Trace slow requests into databases and dependencies. 6.
+Form a hypothesis, change one variable, and verify.
+
+### Q7. How do you determine capacity?
+
+**Answer framework:** 1. Define workload and SLOs. 2. Test progressively
+with realistic requests. 3. Record throughput, P95/P99, errors, CPU,
+memory, and dependencies. 4. Find the saturation point. 5. Test failure
+scenarios. 6. Define safe capacity with headroom rather than using peak
+throughput alone.
+
+### Q8. Why can retries make an outage worse?
+
+Retries increase offered load when a service may already be overloaded.
+Multiple retrying layers can multiply requests. Use bounded retries,
+backoff with jitter, deadlines, and idempotency protection for writes.
+
+### Q9. What is the difference between health and readiness?
+
+A process can be alive but unable to serve traffic. Liveness asks
+whether the process should continue running; readiness asks whether it
+should receive requests. Health-check semantics should reflect the
+service's real ability to handle work.
+
+### Q10. What would you do during a production incident?
+
+1.  Establish impact and scope.
+2.  Check dashboards and logs.
+3.  Correlate symptoms with changes and dependencies.
+4.  Mitigate based on evidence.
+5.  Communicate impact, actions, risks, and next update.
+6.  Verify recovery.
+7.  Complete a blameless post-incident review with corrective actions.
+
+------------------------------------------------------------------------
+
+## 17. Engineering Leader versus Senior Engineer emphasis
+
+### Senior Software Engineer
+
+Show technical depth: - Explain algorithm trade-offs. - Design timeouts,
+retries, and safe failure handling. - Interpret Nginx timing fields. -
+Use latency percentiles and capacity testing. - Diagnose bottlenecks
+across services. - Explain how you validate assumptions experimentally.
+
+### Engineering Leader
+
+Show system ownership: - Connect availability and latency to customer
+impact and SLOs. - Make trade-offs explicit: cost, complexity,
+resilience, and delivery risk. - Ensure failure modes are tested, not
+merely documented. - Establish useful dashboards, alerts, runbooks, and
+incident ownership. - Plan capacity and headroom around demand and
+failure scenarios. - Lead blameless postmortems and prioritize
+prevention. - Communicate risk and mitigation clearly to technical and
+non-technical stakeholders.
+
+### Strong leadership answer structure
+
+Use this sequence: 1. **Context:** What customer or business problem
+existed? 2. **Evidence:** What metrics or incident data showed the
+problem? 3. **Options:** What alternatives did you consider? 4.
+**Decision:** Why did you choose the approach? 5. **Trade-offs:** What
+cost or complexity did you accept? 6. **Execution:** How did you test,
+roll out, and monitor it? 7. **Outcome:** What measurable improvement
+occurred? 8. **Learning:** What would you improve next?
+
+Do not invent impact metrics in an interview. Use actual measurements,
+or clearly label estimates and assumptions.
+
+------------------------------------------------------------------------
+
+## 18. Common interview mistakes to avoid
+
+-   Saying round robin guarantees equal CPU usage.
+-   Treating active connections as a perfect measure of workload.
+-   Assuming two load-balancer instances automatically provide HA.
+-   Claiming that Nginx Open Source supports every NGINX Plus feature.
+-   Treating `proxy_read_timeout` as a total request deadline.
+-   Retrying every request without considering duplicate side effects.
+-   Using average latency alone.
+-   Declaring capacity based on a short test without SLOs or failure
+    testing.
+-   Assuming a 502 or 504 proves a particular root cause.
+-   Removing a backend without checking whether the survivors have
+    enough capacity.
+-   Increasing timeouts without considering queueing and resource
+    exhaustion.
+-   Treating health checks as a substitute for monitoring and incident
+    response.
+
+------------------------------------------------------------------------
+
+## 19. Quick revision sheet
+
+  -----------------------------------------------------------------------
+  Topic                               Remember
+  ----------------------------------- -----------------------------------
+  Load balancing                      Distributes requests/connections;
+                                      does not remove all bottlenecks
+
+  Round robin                         Simple sequential selection
+
+  Weighted round robin                Configured relative capacity
+
+  Least connections                   Uses active connections as a load
+                                      proxy
+
+  IP hash / affinity                  Can improve stickiness but may
+                                      create imbalance
+
+  Consistent hashing                  Helps preserve key locality when
+                                      membership changes
+
+  L4                                  IP/port/transport-level routing
+
+  L7                                  HTTP-aware routing, such as path or
+                                      hostname
+
+  Readiness                           Should this instance receive
+                                      traffic?
+
+  Liveness                            Is the process alive, or should it
+                                      be restarted?
+
+  Passive failure handling            Infers failures from real requests
+
+  Timeout                             Bounds waiting; distinguish
+                                      per-operation timeout from
+                                      end-to-end deadline
+
+  Retry                               Can improve resilience but can
+                                      amplify load or duplicate writes
+
+  Cascading failure                   One failure overloads other
+                                      components
+
+  High availability                   Includes the entry point and
+                                      dependencies, not just extra
+                                      instances
+
+  P50/P95/P99                         Typical, slower-tail, and
+                                      extreme-tail latency
+
+  Capacity testing                    Measure throughput, latency,
+                                      errors, and saturation under
+                                      realistic load
+
+  Little's Law                        `L = λ × W`
+
+  Observability                       Metrics for patterns, logs for
+                                      events, traces for cross-service
+                                      timing
+
+  Incident response                   Establish impact, investigate,
+                                      mitigate, verify, learn
+  -----------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 20. Suggested Bitbucket repository structure
+
+``` text
+system-design-patterns/
+└── load-balancing/
+    ├── README.md
+    ├── nginx.conf
+    ├── lab-setup.md
+    ├── capacity-test-results.md
+    ├── troubleshooting-runbook.md
+    └── interview-questions.md
+```
+
+Suggested contents: - `README.md`: core concepts, architecture,
+algorithm comparison, L4/L7, health and failure handling. -
+`nginx.conf`: your working local lab configuration. - `lab-setup.md`:
+setup commands and how to start/stop each backend. -
+`capacity-test-results.md`: test conditions, throughput, percentiles,
+errors, and observations. - `troubleshooting-runbook.md`: symptoms,
+evidence to collect, diagnostic steps, mitigation, and verification. -
+`interview-questions.md`: concise answers and STAR examples based on
+your actual experience.
+
+------------------------------------------------------------------------
+
+## Final interview takeaway
+
+A strong answer does more than name an algorithm. It explains **why the
+design fits the workload, what happens when components fail, how the
+team measures performance, how much traffic the system can safely
+sustain, and how recovery is verified in production**.
+
+For a senior engineer, demonstrate technical reasoning and
+evidence-based troubleshooting. For an engineering leader, additionally
+demonstrate ownership of reliability objectives, capacity risk,
+operational readiness, incident communication, and measurable outcomes.
